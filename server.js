@@ -18,6 +18,37 @@ function formatError(err) {
   return base + code;
 }
 
+// Helper: perform a Shopware search with a retry toggling multi operator case
+async function searchWithRetry(pathname, criteria, reqId) {
+  // First try as-is
+  try {
+    return await shopwareFetch(pathname, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Request-ID": reqId },
+      body: JSON.stringify(criteria),
+    });
+  } catch (e) {
+    const msg = String(e && e.message || "");
+    // Retry only on 400 Bad Request, which often indicates operator casing incompatibility
+    if (!msg.startsWith("400 ")) throw e;
+    try {
+      const original = JSON.stringify(criteria);
+      // Toggle between "or" and "OR" for multi filter operator occurrences
+      const toggled = original
+        .replace(/"operator":"or"/g, '"operator":"OR"')
+        .replace(/"operator":"OR"/g, '"operator":"or"');
+      if (toggled === original) throw e;
+      return await shopwareFetch(pathname, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Request-ID": reqId },
+        body: toggled,
+      });
+    } catch (e2) {
+      throw e; // keep original error context
+    }
+  }
+}
+
 // ----------- Logger -----------
 const LOG_LEVEL = (process.env.LOG_LEVEL || "info").toLowerCase();
 const LEVELS = { error: 0, warn: 1, info: 2, debug: 3, trace: 4 };
@@ -368,11 +399,7 @@ app.get("/api/orders", requireAuth, async (req, res) => {
   };
 
   try {
-    const sw = await shopwareFetch("/search/order", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Request-ID": req.id },
-      body: JSON.stringify(criteria),
-    });
+    const sw = await searchWithRetry("/search/order", criteria, req.id);
 
     const items = (sw.data || []).map((o) => {
       const state = o.stateMachineState?.name || null;
@@ -701,6 +728,7 @@ app.get("/api/customers", requireAuth, async (req, res) => {
         { type: "contains", field: "firstName", value: q },
         { type: "contains", field: "lastName", value: q },
         { type: "contains", field: "email", value: q },
+        { type: "contains", field: "customerNumber", value: q },
       ],
     });
   }
@@ -715,11 +743,7 @@ app.get("/api/customers", requireAuth, async (req, res) => {
   };
 
   try {
-    const sw = await shopwareFetch("/search/customer", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Request-ID": req.id },
-      body: JSON.stringify(criteria),
-    });
+    const sw = await searchWithRetry("/search/customer", criteria, req.id);
 
     const items = (sw.data || []).map((c) => ({
       id: c.id,

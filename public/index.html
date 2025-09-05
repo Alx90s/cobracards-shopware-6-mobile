@@ -408,6 +408,7 @@
           pages: { products: 1, orders: 1, customers: 1 },
           loading: false,
           done: { products: false, orders: false, customers: false },
+          searchMode: false,
         };
 
         const api = {
@@ -475,12 +476,18 @@
           tabs.forEach((t) =>
             t.classList.toggle("active", t.dataset.tab === tab)
           );
-          $("#q").value = state.q = "";
           routeEl.innerHTML = "";
           state.pages[tab] = 1;
           state.done[tab] = false;
-          renderListSkeleton();
-          loadMore();
+          if (state.q && state.q.length > 0) {
+            state.searchMode = true;
+            renderListSkeleton();
+            doGlobalSearch();
+          } else {
+            state.searchMode = false;
+            renderListSkeleton();
+            loadMore();
+          }
         }
 
         function renderListSkeleton() {
@@ -810,6 +817,7 @@
         }
 
         async function loadMore() {
+          if (state.searchMode) return;
           if (state.loading || state.done[state.tab]) return;
           state.loading = true;
           try {
@@ -886,6 +894,61 @@
           }
         }
 
+        // Global search across all tabs
+        async function doGlobalSearch() {
+          const q = (state.q || "").trim();
+          if (!q) {
+            state.searchMode = false;
+            routeEl.innerHTML = "";
+            renderListSkeleton();
+            return loadMore();
+          }
+          try {
+            const [prod, ord, cust] = await Promise.all([
+              api.list("products", { page: 1, limit: 10, q }),
+              api.list("orders", { page: 1, limit: 10, q }),
+              api.list("customers", { page: 1, limit: 10, q }),
+            ]);
+            const wrap = el("div");
+            wrap.appendChild(
+              el("div", "section-title", `Suchergebnisse für „${q}”`)
+            );
+            const addSection = (title, items, renderFn, emptyTxt) => {
+              const card = el("div", "card");
+              card.appendChild(el("div", "muted", title));
+              card.style.marginBottom = "12px";
+              const list = el("div", "list");
+              if (items && items.length) {
+                items.forEach((x) => list.appendChild(renderFn(x)));
+              } else list.appendChild(el("div", "muted", emptyTxt));
+              card.appendChild(list);
+              wrap.appendChild(card);
+            };
+            addSection(
+              "Produkte",
+              prod.data || [],
+              productItem,
+              "Keine Produkte gefunden."
+            );
+            addSection(
+              "Bestellungen",
+              ord.data || [],
+              orderItem,
+              "Keine Bestellungen gefunden."
+            );
+            addSection(
+              "Kunden",
+              cust.data || [],
+              customerItem,
+              "Keine Kunden gefunden."
+            );
+            routeEl.innerHTML = "";
+            routeEl.appendChild(wrap);
+          } catch (e) {
+            routeEl.innerHTML = `<div class='card'>Suche fehlgeschlagen.</div>`;
+          }
+        }
+
         // Scroll-based infinite loading
         window.addEventListener(
           "scroll",
@@ -893,7 +956,7 @@
             const nearBottom =
               window.innerHeight + window.scrollY >=
               document.body.offsetHeight - 200;
-            if (nearBottom) loadMore();
+            if (nearBottom && !state.searchMode) loadMore();
           },
           { passive: true }
         );
@@ -903,10 +966,18 @@
           state.q = e.target.value.trim();
           state.pages[state.tab] = 1;
           state.done[state.tab] = false;
-          routeEl.innerHTML = "";
-          renderListSkeleton();
           clearTimeout(window.__qdeb);
-          window.__qdeb = setTimeout(() => loadMore(), 300);
+          if (state.q) {
+            state.searchMode = true;
+            routeEl.innerHTML = "";
+            renderListSkeleton();
+            window.__qdeb = setTimeout(() => doGlobalSearch(), 250);
+          } else {
+            state.searchMode = false;
+            routeEl.innerHTML = "";
+            renderListSkeleton();
+            window.__qdeb = setTimeout(() => loadMore(), 100);
+          }
         });
         $("#qClear").addEventListener("click", () => {
           $("#q").value = "";

@@ -111,6 +111,9 @@ function toggleApiSuffix(base) {
 const SHOPWARE_CLIENT_ID = process.env.SHOPWARE_CLIENT_ID || "";
 const SHOPWARE_CLIENT_SECRET = process.env.SHOPWARE_CLIENT_SECRET || "";
 const SHOP_NAME = process.env.SHOP_NAME || "Shop";
+const ENABLE_INVOICE_ACTIONS = !["0", "false", "off"].includes(String(process.env.ENABLE_INVOICE_ACTIONS || "true").toLowerCase());
+const ENABLE_ORDER_NUMBER_RESERVE = !["0", "false", "off"].includes(String(process.env.ENABLE_ORDER_NUMBER_RESERVE || "true").toLowerCase());
+const ENABLE_ORDER_CONFIRMATION_EMAIL = ["1", "true", "on"].includes(String(process.env.ENABLE_ORDER_CONFIRMATION_EMAIL || "false").toLowerCase());
 
 if (!SHOPWARE_CLIENT_ID || !SHOPWARE_CLIENT_SECRET) {
   console.warn(
@@ -425,6 +428,412 @@ app.get("/api/orders", requireAuth, async (req, res) => {
   }
 });
 
+// Create a new order
+app.post("/api/orders", requireAuth, async (req, res) => {
+  const reqId = req.id;
+  try {
+    const body = req.body || {};
+    const { customerId, customer, paymentMethodId, items } = body;
+    let { salesChannelId, currencyId, languageId, shippingMethodId } = body;
+    const shippingCostsOverride = Number(body.shippingCosts ?? 0) || 0;
+
+    if (!paymentMethodId) {
+      return res.status(400).json({ error: "paymentMethodId is required" });
+    }
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "items array is required" });
+    }
+    if (!customerId && !customer) {
+      return res.status(400).json({ error: "customerId or customer object is required" });
+    }
+
+    function hex32() {
+      return crypto.randomBytes(16).toString("hex");
+    }
+
+    async function getDefaultSalesChannel() {
+      if (salesChannelId) {
+        try {
+          const sc = await shopwareFetch(`/sales-channel/${encodeURIComponent(salesChannelId)}`);
+          return sc && sc.data ? sc.data : sc;
+        } catch (e) {
+          // fall through to search
+        }
+      }
+      const r = await shopwareFetch("/search/sales-channel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Request-ID": reqId },
+        body: JSON.stringify({
+          page: 1,
+          limit: 1,
+          sort: [{ field: "createdAt", order: "ASC" }],
+          filter: [{ type: "equals", field: "active", value: true }],
+        }),
+      });
+      const sc = (r && r.data && r.data[0]) || null;
+      if (!sc) throw new Error("No active sales channel found");
+      return sc;
+    }
+
+    async function getCurrency(curId) {
+      const c = await shopwareFetch(`/currency/${encodeURIComponent(curId)}`);
+      return c && c.data ? c.data : c;
+    }
+
+    async function getStateId(machineTechnicalName, technicalName) {
+      const r = await shopwareFetch("/search/state-machine-state", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Request-ID": reqId },
+        body: JSON.stringify({
+          page: 1,
+          limit: 1,
+          filter: [
+            { type: "equals", field: "technicalName", value: technicalName },
+            { type: "equals", field: "stateMachine.technicalName", value: machineTechnicalName },
+          ],
+        }),
+      });
+      const st = (r && r.data && r.data[0]) || null;
+      if (!st) throw new Error(`State '${technicalName}' not found for ${machineTechnicalName}`);
+      return st.id;
+    }
+
+    async function getDefaultSalutationId() {
+      // Try not_specified then mr, else fallback to first
+      for (const key of ["not_specified", "mr"]) {
+        try {
+          const r = await shopwareFetch("/search/salutation", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-Request-ID": reqId },
+            body: JSON.stringify({ page: 1, limit: 1, filter: [{ type: "equals", field: "salutationKey", value: key }] }),
+          });
+          if (r && r.data && r.data[0]) return r.data[0].id;
+        } catch {}
+      }
+      const r = await shopwareFetch("/search/salutation", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Request-ID": reqId },
+        body: JSON.stringify({ page: 1, limit: 1 }),
+      });
+      if (r && r.data && r.data[0]) return r.data[0].id;
+      throw new Error("No salutation found");
+    }
+
+    async function getCustomerDetails(id) {
+      const r = await shopwareFetch("/search/customer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Request-ID": reqId },
+        body: JSON.stringify({
+          page: 1,
+          limit: 1,
+          associations: { defaultBillingAddress: {}, defaultShippingAddress: {}, salutation: {} },
+          filter: [{ type: "equals", field: "id", value: id }],
+        }),
+      });
+      const c = (r && r.data && r.data[0]) || null;
+      if (!c) throw new Error("Customer not found");
+      return c;
+    }
+
+    async function getProductBy(ref) {
+      // ref: { productId?, productNumber? }
+      if (ref.productId) {
+        const r = await shopwareFetch("/search/product", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Request-ID": reqId },
+          body: JSON.stringify({ page: 1, limit: 1, filter: [{ type: "equals", field: "id", value: ref.productId }] }),
+        });
+        return (r && r.data && r.data[0]) || null;
+      }
+      if (ref.productNumber) {
+        const r = await shopwareFetch("/search/product", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Request-ID": reqId },
+          body: JSON.stringify({ page: 1, limit: 1, filter: [{ type: "equals", field: "productNumber", value: ref.productNumber }] }),
+        });
+        return (r && r.data && r.data[0]) || null;
+      }
+      return null;
+    }
+
+    // 1) Resolve sales channel defaults
+    const sc = await getDefaultSalesChannel();
+    salesChannelId = salesChannelId || sc.id;
+    currencyId = currencyId || sc.currencyId;
+    languageId = languageId || sc.languageId;
+    shippingMethodId = shippingMethodId || sc.shippingMethodId;
+
+    // 2) Resolve currency rounding and factor
+    const currency = await getCurrency(currencyId);
+    function sanitizeRounding(r) {
+      return {
+        decimals: Number(r?.decimals ?? 2),
+        interval: Number(r?.interval ?? 0.01),
+        roundForNet: Boolean(r?.roundForNet ?? true),
+      };
+    }
+    const itemRounding = sanitizeRounding(currency?.itemRounding || {});
+    const totalRounding = sanitizeRounding(currency?.totalRounding || {});
+    const currencyFactor = Number(currency?.factor ?? 1.0) || 1.0;
+
+    // 3) Resolve states
+    const orderStateId = await getStateId("order.state", "open");
+    const transactionStateId = await getStateId("order_transaction.state", "open");
+    const deliveryStateId = await getStateId("order_delivery.state", "open");
+
+    // 4) Resolve customer payload and addresses
+    const orderId = hex32();
+    // Optionally reserve an order number from number-range (requires _action path to be reachable)
+    let reservedOrderNumber = null;
+    if (ENABLE_ORDER_NUMBER_RESERVE) {
+      try {
+        const url = `${adminBase}/_action/number-range/reserve/order/${encodeURIComponent(salesChannelId)}`;
+        const resp = await fetch(url, { headers: { Authorization: `Bearer ${await getShopwareToken()}` } });
+        if (resp.ok) {
+          const j = await resp.json();
+          if (j && j.number) reservedOrderNumber = String(j.number);
+        } else {
+          const t = await resp.text();
+          log("warn", "order_number_reserve_failed", { status: resp.status, body: t.slice(0, 300) });
+        }
+      } catch (e) {
+        log("warn", "order_number_reserve_error", { err: formatError(e) });
+      }
+    }
+    let orderCustomer;
+    let billingAddr;
+    let shippingAddr;
+    if (customerId) {
+      const c = await getCustomerDetails(customerId);
+      const salId = c.salutationId || (await getDefaultSalutationId());
+      orderCustomer = {
+        id: hex32(),
+        orderId,
+        customerId: c.id,
+        email: c.email,
+        salutationId: salId,
+        firstName: c.firstName || "",
+        lastName: c.lastName || "",
+        customerNumber: c.customerNumber || undefined,
+      };
+      const b = c.defaultBillingAddress || c.defaultShippingAddress;
+      if (!b) throw new Error("Customer has no default address");
+      billingAddr = {
+        id: hex32(),
+        orderId,
+        countryId: b.countryId,
+        salutationId: b.salutationId || salId,
+        firstName: b.firstName || c.firstName || "",
+        lastName: b.lastName || c.lastName || "",
+        street: b.street || "",
+        zipcode: b.zipcode || "",
+        city: b.city || "",
+        company: b.company || undefined,
+      };
+      const s = c.defaultShippingAddress || c.defaultBillingAddress;
+      shippingAddr = {
+        id: hex32(),
+        orderId,
+        countryId: s.countryId,
+        salutationId: s.salutationId || salId,
+        firstName: s.firstName || c.firstName || "",
+        lastName: s.lastName || c.lastName || "",
+        street: s.street || "",
+        zipcode: s.zipcode || "",
+        city: s.city || "",
+        company: s.company || undefined,
+      };
+    } else {
+      const cust = customer || {};
+      const salId = cust.salutationId || (await getDefaultSalutationId());
+      if (!cust.email || !cust.firstName || !cust.lastName) {
+        return res.status(400).json({ error: "customer.email, firstName, lastName are required when creating a guest order" });
+      }
+      const b = cust.billingAddress || {};
+      if (!b.countryId || !b.street || !b.city) {
+        return res.status(400).json({ error: "customer.billingAddress.countryId, street and city are required" });
+      }
+      orderCustomer = {
+        id: hex32(),
+        orderId,
+        email: cust.email,
+        salutationId: salId,
+        firstName: cust.firstName,
+        lastName: cust.lastName,
+      };
+      billingAddr = {
+        id: hex32(),
+        orderId,
+        countryId: b.countryId,
+        salutationId: b.salutationId || salId,
+        firstName: b.firstName || cust.firstName,
+        lastName: b.lastName || cust.lastName,
+        street: b.street,
+        zipcode: b.zipcode || "",
+        city: b.city,
+        company: b.company || undefined,
+      };
+      const s = cust.shippingAddress || b;
+      shippingAddr = {
+        id: hex32(),
+        orderId,
+        countryId: s.countryId,
+        salutationId: s.salutationId || salId,
+        firstName: s.firstName || cust.firstName,
+        lastName: s.lastName || cust.lastName,
+        street: s.street,
+        zipcode: s.zipcode || "",
+        city: s.city,
+        company: s.company || undefined,
+      };
+    }
+
+    // 5) Resolve products and build line items
+    const lineItems = [];
+    function makeCalculatedPrice(unitPrice, qty) {
+      const u = Number(unitPrice) || 0;
+      const q = Math.max(1, Number(qty) || 1);
+      return {
+        unitPrice: u,
+        totalPrice: u * q,
+        quantity: q,
+        calculatedTaxes: [],
+        taxRules: [],
+      };
+    }
+
+    for (const it of items) {
+      const qty = Math.max(1, parseInt(it.quantity || 1, 10));
+      const p = await getProductBy(it);
+      if (!p) return res.status(400).json({ error: `Product not found for item: ${JSON.stringify(it)}` });
+      // Choose price for currencyId if available
+      let unitPrice = null;
+      if (Array.isArray(p.price)) {
+        const match = p.price.find((x) => !x.currencyId || x.currencyId === currencyId) || p.price[0];
+        if (match && typeof match.gross === "number") unitPrice = match.gross;
+        else if (match && typeof match.net === "number") unitPrice = match.net;
+      }
+      if (unitPrice == null) unitPrice = Number(p.price?.gross) || Number(p.price?.net) || 0;
+      lineItems.push({
+        id: hex32(),
+        orderId,
+        productId: p.id,
+        referencedId: p.id,
+        identifier: p.productNumber || p.id,
+        label: it.label || p.name || p.productNumber || "Item",
+        quantity: qty,
+        states: [],
+        price: makeCalculatedPrice(unitPrice, qty),
+        children: [],
+        payload: { productNumber: p.productNumber || undefined },
+      });
+    }
+
+    const itemsTotal = lineItems.reduce((sum, li) => sum + (Number(li.price?.totalPrice) || 0), 0);
+
+    // 6) Build transactions
+    const transaction = {
+      id: hex32(),
+      orderId,
+      paymentMethodId,
+      stateId: transactionStateId,
+      amount: { ...makeCalculatedPrice(itemsTotal, 1) },
+    };
+
+    // 7) Build deliveries (minimal)
+    const now = new Date();
+    const latest = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000);
+    const delivery = {
+      id: hex32(),
+      orderId,
+      shippingOrderAddressId: shippingAddr.id,
+      shippingMethodId,
+      stateId: deliveryStateId,
+      shippingDateEarliest: now.toISOString(),
+      shippingDateLatest: latest.toISOString(),
+      shippingCosts: { unitPrice: shippingCostsOverride, totalPrice: shippingCostsOverride, quantity: 1, calculatedTaxes: [], taxRules: [] },
+    };
+
+    // 8) Assemble order payload
+    const orderPayload = {
+      id: orderId,
+      ...(reservedOrderNumber ? { orderNumber: reservedOrderNumber } : {}),
+      salesChannelId,
+      currencyId,
+      languageId,
+      orderDateTime: new Date().toISOString(),
+      currencyFactor: Number(currencyFactor) || 1.0,
+      stateId: orderStateId,
+      itemRounding,
+      totalRounding,
+      price: {
+        netPrice: itemsTotal, // approximate when gross is unknown
+        totalPrice: itemsTotal,
+        positionPrice: itemsTotal,
+        rawTotal: itemsTotal,
+        taxStatus: "gross",
+        calculatedTaxes: [],
+        taxRules: [],
+      },
+      shippingCosts: { unitPrice: shippingCostsOverride, totalPrice: shippingCostsOverride, quantity: 1, calculatedTaxes: [], taxRules: [] },
+      orderCustomer,
+      billingAddressId: billingAddr.id,
+      billingAddress: billingAddr,
+      addresses: [billingAddr, shippingAddr],
+      lineItems,
+      transactions: [transaction],
+      deliveries: [delivery],
+    };
+
+    // 9) Create order (avoid _response query to reduce chance of WAF 403 on underscore params)
+    // Use raw fetch so 204 No Content is handled correctly.
+    {
+      const url = `${adminBase}/order`;
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${await getShopwareToken()}`, Accept: "application/json" },
+        body: JSON.stringify(orderPayload),
+      });
+      if (!resp.ok) {
+        const txt = await resp.text();
+        log("error", "shopware.create_order_failed", { url, status: resp.status, body: txt.slice(0, 500) });
+        throw new Error(`${resp.status} ${txt}`);
+      }
+    }
+
+    // Try to fetch the created order for the number
+    let orderNumber = null;
+    try {
+      const det = await shopwareFetch(`/order/${orderId}`);
+      const d = det && det.data ? det.data : det;
+      orderNumber = d && d.orderNumber ? d.orderNumber : null;
+    } catch {}
+
+    // Optionally send an order confirmation via state transition (requires business events + _action route)
+    if (ENABLE_ORDER_CONFIRMATION_EMAIL) {
+      try {
+        const url = `${adminBase}/_action/order/${orderId}/state/process`;
+        const resp = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${await getShopwareToken()}` },
+          body: JSON.stringify({ sendMail: true }),
+        });
+        if (!resp.ok) {
+          const t = await resp.text();
+          log("warn", "order_confirmation_send_failed", { status: resp.status, body: t.slice(0, 300) });
+        }
+      } catch (e) {
+        log("warn", "order_confirmation_send_error", { err: formatError(e) });
+      }
+    }
+
+    res.json({ ok: true, data: { id: orderId, orderNumber: orderNumber || reservedOrderNumber || null } });
+  } catch (e) {
+    log("error", "route.error", { reqId, route: "/api/orders [POST]", err: formatError(e) });
+    res.status(500).json({ error: formatError(e) });
+  }
+});
+
 // Orders metrics: counts for today, last 7/30 days, this year
 app.get("/api/orders/metrics", requireAuth, async (req, res) => {
   // Use UTC-based date boundaries
@@ -554,10 +963,19 @@ app.get("/api/orders/:id", requireAuth, async (req, res) => {
   }
 });
 
+// Feature flags surfaced to frontend
+app.get("/api/features", requireAuth, (req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.json({ invoiceActions: ENABLE_INVOICE_ACTIONS });
+});
+
 // Create an invoice (Rechnung) for an order and return latest invoice document info
 app.post("/api/orders/:id/invoice", requireAuth, async (req, res) => {
   const id = req.params.id;
   try {
+    if (!ENABLE_INVOICE_ACTIONS) {
+      return res.status(501).json({ error: "Invoice actions disabled by server config" });
+    }
     // 1) Create invoice document
     await shopwareFetch("/_action/order/document/invoice/create", {
       method: "POST",
@@ -661,6 +1079,9 @@ app.get("/api/documents/:id/download", requireAuth, async (req, res) => {
 app.post("/api/orders/:id/invoice-email", requireAuth, async (req, res) => {
   const id = req.params.id;
   try {
+    if (!ENABLE_INVOICE_ACTIONS) {
+      return res.status(501).json({ error: "Invoice actions disabled by server config" });
+    }
     // 1) Create invoice document
     await shopwareFetch("/_action/order/document/invoice/create", {
       method: "POST",
@@ -839,6 +1260,112 @@ app.get("/api/customers/:id/orders", requireAuth, async (req, res) => {
     res.json({ total: sw.total || items.length, data: items });
   } catch (e) {
     log("error", "route.error", { reqId: req.id, route: "/api/customers/:id/orders", err: formatError(e) });
+    res.status(500).json({ error: formatError(e) });
+  }
+});
+
+// Payment methods list (for order creation UI)
+app.get("/api/payment-methods", requireAuth, async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page || "1", 10));
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || "50", 10)));
+  const q = (req.query.q || "").trim();
+  // Determine default sales channel
+  async function getDefaultSalesChannel() {
+    const r = await shopwareFetch("/search/sales-channel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Request-ID": req.id },
+      body: JSON.stringify({ page: 1, limit: 1, sort: [{ field: "createdAt", order: "ASC" }], filter: [{ type: "equals", field: "active", value: true }] }),
+    });
+    return (r && r.data && r.data[0]) || null;
+  }
+  try {
+    const sc = await getDefaultSalesChannel();
+    const baseFilters = [{ type: "equals", field: "active", value: true }];
+    if (q) baseFilters.push({ type: "contains", field: "name", value: q });
+
+    async function query(filters) {
+      const criteria = {
+        page,
+        limit,
+        sort: [{ field: "position", order: "ASC" }, { field: "name", order: "ASC" }],
+        "total-count-mode": "exact",
+        filter: filters,
+      };
+      return searchWithRetry("/search/payment-method", criteria, req.id);
+    }
+
+    // Try: active + assigned to default sales channel
+    let sw = null;
+    if (sc && sc.id) {
+      sw = await query([...baseFilters, { type: "equals", field: "salesChannels.id", value: sc.id }]);
+    }
+    // Fallback: only active (across all channels)
+    if (!sw || !Array.isArray(sw.data) || sw.data.length === 0) {
+      sw = await query(baseFilters);
+    }
+    // Last resort: no filters (if backend mislabels active or associations)
+    if (!sw || !Array.isArray(sw.data) || sw.data.length === 0) {
+      sw = await query(q ? [{ type: "contains", field: "name", value: q }] : []);
+    }
+
+    const data = (sw.data || [])
+      .filter((p) => p && p.id && p.active)
+      .map((p) => ({ id: p.id, name: p.name, active: p.active }));
+    res.set("Cache-Control", "no-store");
+    res.json({ total: sw.total || data.length, data });
+  } catch (e) {
+    log("error", "route.error", { reqId: req.id, route: "/api/payment-methods", err: formatError(e) });
+    res.status(500).json({ error: formatError(e) });
+  }
+});
+
+// Countries list (for guest address input)
+app.get("/api/countries", requireAuth, async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page || "1", 10));
+  const limit = Math.min(250, Math.max(1, parseInt(req.query.limit || "50", 10)));
+  const q = (req.query.q || "").trim();
+  const filters = [{ type: "equals", field: "active", value: true }];
+  if (q) filters.push({ type: "contains", field: "name", value: q });
+  const criteria = { page, limit, sort: [{ field: "name", order: "ASC" }], "total-count-mode": "exact", filter: filters };
+  try {
+    const sw = await searchWithRetry("/search/country", criteria, req.id);
+    const data = (sw.data || []).map((c) => ({ id: c.id, name: c.name, iso: c.iso || c.iso3 || null }));
+    res.set("Cache-Control", "no-store");
+    res.json({ total: sw.total || data.length, data });
+  } catch (e) {
+    log("error", "route.error", { reqId: req.id, route: "/api/countries", err: formatError(e) });
+    res.status(500).json({ error: formatError(e) });
+  }
+});
+
+// Shipping methods list (for order creation UI)
+app.get("/api/shipping-methods", requireAuth, async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page || "1", 10));
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || "50", 10)));
+  const q = (req.query.q || "").trim();
+  async function getDefaultSalesChannel() {
+    const r = await shopwareFetch("/search/sales-channel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Request-ID": req.id },
+      body: JSON.stringify({ page: 1, limit: 1, sort: [{ field: "createdAt", order: "ASC" }], filter: [{ type: "equals", field: "active", value: true }] }),
+    });
+    return (r && r.data && r.data[0]) || null;
+  }
+  try {
+    const sc = await getDefaultSalesChannel();
+    const filters = [{ type: "equals", field: "active", value: true }];
+    if (sc && sc.id) filters.push({ type: "equals", field: "salesChannels.id", value: sc.id });
+    if (q) filters.push({ type: "contains", field: "name", value: q });
+    const criteria = { page, limit, sort: [{ field: "position", order: "ASC" }, { field: "name", order: "ASC" }], "total-count-mode": "exact", filter: filters };
+    let sw = await searchWithRetry("/search/shipping-method", criteria, req.id);
+    if (!sw || !Array.isArray(sw.data) || sw.data.length === 0) {
+      sw = await searchWithRetry("/search/shipping-method", { page, limit }, req.id);
+    }
+    const data = (sw.data || []).filter((s) => s && s.id && s.active).map((s) => ({ id: s.id, name: s.name }));
+    res.set("Cache-Control", "no-store");
+    res.json({ total: sw.total || data.length, data });
+  } catch (e) {
+    log("error", "route.error", { reqId: req.id, route: "/api/shipping-methods", err: formatError(e) });
     res.status(500).json({ error: formatError(e) });
   }
 });

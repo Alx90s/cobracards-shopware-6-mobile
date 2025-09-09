@@ -290,6 +290,36 @@
         margin-top: 6px;
       }
 
+      /* Busy overlay */
+      .busy {
+        position: fixed;
+        inset: 0;
+        display: none;
+        place-items: center;
+        background: rgba(0, 0, 0, 0.35);
+        backdrop-filter: blur(6px);
+        z-index: 9999;
+      }
+      .busy .panel {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        background: var(--card);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 16px;
+        padding: 14px 16px;
+        box-shadow: var(--shadow);
+      }
+      .spinner {
+        width: 22px;
+        height: 22px;
+        border-radius: 999px;
+        border: 3px solid rgba(255, 255, 255, 0.15);
+        border-top-color: var(--acc);
+        animation: spin 0.75s linear infinite;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
+
       @media (min-width: 720px) {
         .desktop-info {
           display: block;
@@ -394,6 +424,13 @@
           </button>
         </nav>
       </section>
+      <!-- Busy overlay -->
+      <div id="busy" class="busy" role="alert" aria-live="polite" aria-busy="true" style="display:none">
+        <div class="panel">
+          <div class="spinner" aria-hidden="true"></div>
+          <div id="busyText">Bitte warten…</div>
+        </div>
+      </div>
     </div>
 
     <script>
@@ -409,6 +446,7 @@
           loading: false,
           done: { products: false, orders: false, customers: false },
           searchMode: false,
+          features: { invoiceActions: true },
         };
 
         const api = {
@@ -468,7 +506,52 @@
             if (!r.ok) throw new Error("Failed to load");
             return await r.json();
           },
+          async paymentMethods({ page = 1, limit = 100, q = "" } = {}) {
+            const params = new URLSearchParams({ page, limit, q });
+            const r = await fetch(`/api/payment-methods?` + params);
+            if (!r.ok) throw new Error("Failed to load payment methods");
+            return await r.json();
+          },
+          async countries({ page = 1, limit = 250, q = "" } = {}) {
+            const params = new URLSearchParams({ page, limit, q });
+            const r = await fetch(`/api/countries?` + params);
+            if (!r.ok) throw new Error("Failed to load countries");
+            return await r.json();
+          },
+          async shippingMethods({ page = 1, limit = 100, q = "" } = {}) {
+            const params = new URLSearchParams({ page, limit, q });
+            const r = await fetch(`/api/shipping-methods?` + params);
+            if (!r.ok) throw new Error("Failed to load shipping methods");
+            return await r.json();
+          },
+          async createOrder(payload) {
+            const r = await fetch(`/api/orders`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(payload),
+            });
+            return await r.json();
+          },
+          async features() {
+            const r = await fetch(`/api/features`);
+            if (!r.ok) return { invoiceActions: true };
+            return await r.json();
+          },
         };
+
+        // Busy overlay helpers
+        function showBusy(msg) {
+          const el = document.getElementById("busy");
+          if (!el) return;
+          const t = document.getElementById("busyText");
+          if (t) t.textContent = msg || "Bitte warten…";
+          el.style.display = "grid";
+        }
+        function hideBusy() {
+          const el = document.getElementById("busy");
+          if (!el) return;
+          el.style.display = "none";
+        }
 
         // UI helpers
         function setTab(tab) {
@@ -684,59 +767,64 @@
             buttons.style.flexWrap = "wrap";
             buttons.style.gap = "8px";
             buttons.style.marginTop = "12px";
-            const invoiceBtn = el("button", "cta");
-            invoiceBtn.textContent = "Rechnung erstellen";
-            invoiceBtn.addEventListener("click", async () => {
-              try {
-                invoiceBtn.disabled = true;
-                const old = invoiceBtn.textContent;
-                invoiceBtn.textContent = "Erstelle…";
-                const r = await fetch(`/api/orders/${id}/invoice`, {
-                  method: "POST",
-                });
-                if (!r.ok) throw new Error("Fehler beim Erstellen");
-                const j = await r.json();
-                invoiceBtn.textContent = "Rechnung herunterladen";
-                invoiceBtn.disabled = false;
-                if (j && j.downloadUrl) {
-                  window.open(j.downloadUrl, "_blank");
+            if (state.features.invoiceActions) {
+              const invoiceBtn = el("button", "cta");
+              invoiceBtn.textContent = "Rechnung erstellen";
+              invoiceBtn.addEventListener("click", async () => {
+                try {
+                  showBusy("Rechnung wird erstellt…");
+                  invoiceBtn.disabled = true;
+                  const old = invoiceBtn.textContent;
+                  invoiceBtn.textContent = "Erstelle…";
+                  const r = await fetch(`/api/orders/${id}/invoice`, { method: "POST" });
+                  if (!r.ok) {
+                    const t = await r.text();
+                    throw new Error(t.includes("403") ? "Aktion vom Server blockiert (nginx 403)." : "Fehler beim Erstellen");
+                  }
+                  const j = await r.json();
+                  invoiceBtn.textContent = "Rechnung herunterladen";
+                  invoiceBtn.disabled = false;
+                  if (j && j.downloadUrl) window.open(j.downloadUrl, "_blank");
+                } catch (e) {
+                  invoiceBtn.disabled = false;
+                  invoiceBtn.textContent = "Rechnung erstellen";
+                  alert(String(e.message || e) + "\nBitte /api/_action in Nginx freischalten oder diese Funktion deaktivieren.");
+                } finally {
+                  hideBusy();
                 }
-              } catch (e) {
-                invoiceBtn.disabled = false;
-                invoiceBtn.textContent = "Rechnung erstellen";
-                alert("Rechnung konnte nicht erstellt werden.");
-              }
-            });
+              });
 
-            const invoiceMailBtn = el("button", "cta");
-            invoiceMailBtn.textContent =
-              "Rechnung erstellen und an den Kunden senden";
-            invoiceMailBtn.addEventListener("click", async () => {
-              try {
-                invoiceMailBtn.disabled = true;
-                const old = invoiceMailBtn.textContent;
-                invoiceMailBtn.textContent = "Sende…";
-                const r = await fetch(`/api/orders/${id}/invoice-email`, {
-                  method: "POST",
-                });
-                if (!r.ok) throw new Error("Fehler beim Senden");
-                await r.json();
-                invoiceMailBtn.textContent = "Gesendet";
-                setTimeout(() => {
-                  invoiceMailBtn.textContent = old;
+              const invoiceMailBtn = el("button", "cta");
+              invoiceMailBtn.textContent =
+                "Rechnung erstellen und an den Kunden senden";
+              invoiceMailBtn.addEventListener("click", async () => {
+                try {
+                  showBusy("Rechnung wird erstellt und versendet…");
+                  invoiceMailBtn.disabled = true;
+                  const old = invoiceMailBtn.textContent;
+                  invoiceMailBtn.textContent = "Sende…";
+                  const r = await fetch(`/api/orders/${id}/invoice-email`, { method: "POST" });
+                  if (!r.ok) {
+                    const t = await r.text();
+                    throw new Error(t.includes("403") ? "Aktion vom Server blockiert (nginx 403)." : "Fehler beim Senden");
+                  }
+                  await r.json();
+                  invoiceMailBtn.textContent = "Gesendet";
+                  setTimeout(() => { invoiceMailBtn.textContent = old; invoiceMailBtn.disabled = false; }, 1500);
+                } catch (e) {
                   invoiceMailBtn.disabled = false;
-                }, 1500);
-              } catch (e) {
-                invoiceMailBtn.disabled = false;
-                alert("Rechnung konnte nicht gesendet werden.");
-              }
-            });
+                  alert(String(e.message || e) + "\nBitte /api/_action in Nginx freischalten oder diese Funktion deaktivieren.");
+                } finally {
+                  hideBusy();
+                }
+              });
+              buttons.appendChild(invoiceBtn);
+              buttons.appendChild(invoiceMailBtn);
+            }
 
             const back = el("button", "cta");
             back.textContent = "← Zurück";
             back.addEventListener("click", () => setTab("orders"));
-            buttons.appendChild(invoiceBtn);
-            buttons.appendChild(invoiceMailBtn);
             if (o.customerId) {
               const toCustomer = el("button", "cta");
               toCustomer.textContent = "Zum Kunden";
@@ -833,7 +921,7 @@
               routeEl.innerHTML = "";
               routeEl.appendChild(list);
             }
-            // Ensure metrics card exists for orders (even if skeleton list already existed)
+            // Ensure metrics and quick-create cards exist for orders
             if (
               state.tab === "orders" &&
               !document.getElementById("orderMetrics")
@@ -850,6 +938,15 @@
                 </div>`;
               m.style.marginBottom = "12px";
               routeEl.insertBefore(m, list);
+              // Quick create button
+              const qc = el("div", "card");
+              qc.id = "orderCreate";
+              const btn = el("button", "cta");
+              btn.textContent = "Neue Bestellung";
+              btn.addEventListener("click", openCreateOrder);
+              qc.appendChild(btn);
+              qc.style.marginBottom = "12px";
+              routeEl.insertBefore(qc, list);
               // Load metrics async
               api
                 .ordersMetrics()
@@ -892,6 +989,487 @@
           } finally {
             state.loading = false;
           }
+        }
+
+        // Create Order UI
+        function openCreateOrder() {
+          const createState = {
+            existing: true,
+            customerId: null,
+            customerPick: null,
+            customerQuery: "",
+            customerResults: [],
+            guest: {
+              email: "",
+              firstName: "",
+              lastName: "",
+              billing: { street: "", zipcode: "", city: "", countryId: "" },
+              shippingSame: true,
+              shipping: { street: "", zipcode: "", city: "", countryId: "" },
+            },
+            paymentMethodId: null,
+            pmList: [],
+            countries: [],
+            items: [], // {productId, productNumber, name, qty}
+            productQuery: "",
+            productResults: [],
+            busy: false,
+            err: "",
+          };
+
+          routeEl.innerHTML = "";
+          const wrap = el("div");
+
+          // Header
+          const head = el("div", "card");
+          head.innerHTML = `<div style="font-weight:700">Neue Bestellung</div>`;
+          wrap.appendChild(head);
+
+          // Customer section
+          const cust = el("div", "card");
+          cust.innerHTML = `
+            <div class="section-title">Kunde</div>
+            <div class="row" style="gap:12px;flex-wrap:wrap">
+              <label><input type="radio" name="custMode" value="existing" checked> Bestehender Kunde</label>
+              <label><input type="radio" name="custMode" value="guest"> Gast</label>
+            </div>
+            <div id="custExisting">
+              <div class="field" style="margin-top:8px">
+                <input id="custQ" placeholder="Kunde suchen (Name, Email, Nr.)" />
+                <button type="button">🔎</button>
+              </div>
+              <div id="custResults" class="list" style="margin-top:8px"></div>
+              <div id="custPicked" class="muted" style="margin-top:6px"></div>
+            </div>
+            <div id="custGuest" style="display:none;margin-top:8px">
+              <div class="row" style="gap:8px;flex-wrap:wrap">
+                <div class="field" style="flex:1"><input id="gEmail" placeholder="E‑Mail" /></div>
+                <div class="field" style="flex:1"><input id="gFirst" placeholder="Vorname" /></div>
+                <div class="field" style="flex:1"><input id="gLast" placeholder="Nachname" /></div>
+              </div>
+              <div class="section-title" style="margin-top:10px">Rechnungsadresse</div>
+              <div class="row" style="gap:8px;flex-wrap:wrap">
+                <div class="field" style="flex:2"><input id="gBStreet" placeholder="Straße" /></div>
+                <div class="field" style="flex:1"><input id="gBZip" placeholder="PLZ" /></div>
+                <div class="field" style="flex:2"><input id="gBCity" placeholder="Stadt" /></div>
+              </div>
+              <div class="field" style="margin-top:6px">
+                <select id="gBCountry"></select>
+              </div>
+              <label style="display:block;margin-top:8px"><input id="gSame" type="checkbox" checked> Lieferadresse = Rechnungsadresse</label>
+              <div id="shipBlock" style="display:none">
+                <div class="section-title" style="margin-top:10px">Lieferadresse</div>
+                <div class="row" style="gap:8px;flex-wrap:wrap">
+                  <div class="field" style="flex:2"><input id="gSStreet" placeholder="Straße" /></div>
+                  <div class="field" style="flex:1"><input id="gSZip" placeholder="PLZ" /></div>
+                  <div class="field" style="flex:2"><input id="gSCity" placeholder="Stadt" /></div>
+                </div>
+                <div class="field" style="margin-top:6px">
+                  <select id="gSCountry"></select>
+                </div>
+              </div>
+            </div>
+          `;
+          wrap.appendChild(cust);
+
+          // Payment section
+          const pay = el("div", "card");
+          pay.style.margin = "10px 0";
+          pay.innerHTML = `<div class="section-title">Zahlung & Versand</div>
+            <div class="muted" style="margin-bottom:6px">Zahlungsmethode</div>
+            <div id="pmList" class="list" style="margin-bottom:10px"></div>
+            <div class="muted" style="margin-bottom:6px">Versandart</div>
+            <div id="smList" class="list"></div>
+            <div class="row" style="gap:8px;margin-top:8px">
+              <div class="field" style="flex:1"><input id="shipPrice" inputmode="decimal" placeholder="Versandkosten (z.B. 4.90)" /></div>
+            </div>`;
+          wrap.appendChild(pay);
+
+          // Products section
+          const prod = el("div", "card");
+          prod.style.margin = "0 10px 0 0";
+          prod.innerHTML = `
+            <div class="section-title">Produkte</div>
+            <div class="field"><input id="pQ" placeholder="Produkte suchen…" /></div>
+            <div id="pResults" class="list" style="margin-top:8px"></div>
+            <div class="section-title" style="margin-top:10px">Warenkorb</div>
+            <div id="cart" class="list"></div>
+            <div class="row between" style="margin-top:8px">
+              <div class="muted">Summe</div>
+              <div id="sum" class="price">0,00 €</div>
+            </div>
+          `;
+          wrap.appendChild(prod);
+
+          // Actions
+          const actions = el("div", "card");
+          actions.style.margin = "10px 0";
+          const createBtn = el("button", "cta");
+          createBtn.textContent = "Bestellung anlegen";
+          const backBtn = el("button", "cta");
+          backBtn.textContent = "← Abbrechen";
+          actions.append(createBtn, backBtn);
+          const errBox = el("div", "err");
+          errBox.style.marginTop = "8px";
+          errBox.style.display = "none";
+          actions.appendChild(errBox);
+          wrap.appendChild(actions);
+
+          routeEl.appendChild(wrap);
+
+          // Helpers
+          const fmtMoney = (n) =>
+            new Intl.NumberFormat(undefined, {
+              style: "currency",
+              currency: "EUR",
+            }).format(n || 0);
+          function recompute() {
+            const sumItems = createState.items.reduce(
+              (a, it) => a + Number(it.price || 0) * it.qty,
+              0
+            );
+            const ship =
+              parseFloat(document.getElementById("shipPrice")?.value || "0") ||
+              0;
+            const sum = sumItems + ship;
+            document.getElementById("sum").textContent = fmtMoney(sum);
+            const cart = document.getElementById("cart");
+            cart.innerHTML = "";
+            if (createState.items.length === 0)
+              cart.appendChild(el("div", "muted", "Keine Positionen."));
+            createState.items.forEach((it) => {
+              const row = el("div", "row between");
+              row.innerHTML = `<div>${
+                it.name || it.productNumber || it.productId
+              }</div>`;
+              const ctrls = el("div", "row");
+              const minus = el("button", "cta");
+              minus.textContent = "−";
+              const qty = el("div");
+              qty.style.minWidth = "28px";
+              qty.style.textAlign = "center";
+              qty.textContent = String(it.qty);
+              const plus = el("button", "cta");
+              plus.textContent = "+";
+              minus.addEventListener("click", () => {
+                it.qty = Math.max(1, (it.qty || 1) - 1);
+                recompute();
+              });
+              plus.addEventListener("click", () => {
+                it.qty = (it.qty || 1) + 1;
+                recompute();
+              });
+              const del = el("button", "cta");
+              del.textContent = "✕";
+              del.addEventListener("click", () => {
+                createState.items = createState.items.filter((x) => x !== it);
+                recompute();
+              });
+              ctrls.append(minus, qty, plus, del);
+              row.appendChild(ctrls);
+              cart.appendChild(row);
+            });
+          }
+
+          async function loadPaymentMethods() {
+            try {
+              const { data } = await api.paymentMethods();
+              createState.pmList = data || [];
+              const list = document.getElementById("pmList");
+              list.innerHTML = "";
+              if (!createState.pmList.length) {
+                list.appendChild(
+                  el("div", "muted", "Keine Zahlungsmethoden gefunden.")
+                );
+              } else {
+                createState.pmList.forEach((pm, idx) => {
+                  const row = el("label");
+                  row.style.display = "block";
+                  row.style.padding = "6px 0";
+                  const inp = document.createElement("input");
+                  inp.type = "radio";
+                  inp.name = "pm";
+                  inp.value = pm.id;
+                  if (idx === 0) {
+                    inp.checked = true;
+                    createState.paymentMethodId = pm.id;
+                  }
+                  inp.addEventListener(
+                    "change",
+                    () => (createState.paymentMethodId = pm.id)
+                  );
+                  row.appendChild(inp);
+                  row.append(" ", pm.name || pm.id);
+                  list.appendChild(row);
+                });
+              }
+            } catch {}
+          }
+
+          async function loadCountries() {
+            try {
+              const { data } = await api.countries({ limit: 250 });
+              createState.countries = data || [];
+              const opts = [el("option", "", "Land auswählen")];
+              createState.countries.forEach((c) => {
+                const o = document.createElement("option");
+                o.value = c.id;
+                o.textContent = c.name;
+                opts.push(o);
+              });
+              const bSel = document.getElementById("gBCountry");
+              const sSel = document.getElementById("gSCountry");
+              bSel.innerHTML = "";
+              sSel.innerHTML = "";
+              opts.forEach((o) => {
+                bSel.appendChild(o.cloneNode(true));
+                sSel.appendChild(o.cloneNode(true));
+              });
+            } catch {}
+          }
+
+          async function loadShippingMethods() {
+            try {
+              const { data } = await api.shippingMethods();
+              const list = document.getElementById("smList");
+              list.innerHTML = "";
+              if (!data || !data.length) {
+                list.appendChild(
+                  el("div", "muted", "Keine Versandarten gefunden.")
+                );
+                return;
+              }
+              data.forEach((sm, idx) => {
+                const row = el("label");
+                row.style.display = "block";
+                row.style.padding = "6px 0";
+                const inp = document.createElement("input");
+                inp.type = "radio";
+                inp.name = "sm";
+                inp.value = sm.id;
+                if (idx === 0) inp.checked = true;
+                inp.addEventListener(
+                  "change",
+                  () => (createState.shippingMethodId = sm.id)
+                );
+                row.appendChild(inp);
+                row.append(" ", sm.name || sm.id);
+                list.appendChild(row);
+                if (idx === 0) createState.shippingMethodId = sm.id;
+              });
+            } catch {}
+          }
+
+          async function searchCustomers(q) {
+            const { data } = await api.list("customers", {
+              page: 1,
+              limit: 10,
+              q,
+            });
+            createState.customerResults = data || [];
+            const res = document.getElementById("custResults");
+            res.innerHTML = "";
+            (createState.customerResults || []).forEach((c) => {
+              const item = el("div", "row between");
+              item.style.padding = "6px";
+              item.style.border = "1px solid rgba(255,255,255,0.06)";
+              item.style.borderRadius = "10px";
+              item.innerHTML = `<div>${c.firstName || ""} ${
+                c.lastName || ""
+              }<div class="muted" style="font-size:12px">${
+                c.email || ""
+              }</div></div>`;
+              const pick = el("button", "cta");
+              pick.textContent = "Wählen";
+              pick.addEventListener("click", () => {
+                createState.customerId = c.id;
+                createState.customerPick = c;
+                document.getElementById("custPicked").textContent = `Gewählt: ${
+                  c.firstName || ""
+                } ${c.lastName || ""} <${c.email || ""}>`;
+              });
+              item.appendChild(pick);
+              res.appendChild(item);
+            });
+          }
+
+          async function searchProducts(q) {
+            const { data } = await api.list("products", {
+              page: 1,
+              limit: 10,
+              q,
+            });
+            createState.productResults = data || [];
+            const res = document.getElementById("pResults");
+            res.innerHTML = "";
+            (createState.productResults || []).forEach((p) => {
+              const item = el("div", "row between");
+              item.style.padding = "6px";
+              const left = el("div");
+              left.innerHTML = `<div>${
+                p.name || p.productNumber
+              }</div><div class="muted" style="font-size:12px">${
+                p.productNumber || ""
+              }</div>`;
+              const add = el("button", "cta");
+              add.textContent = "Hinzufügen";
+              add.addEventListener("click", () => {
+                const existing = createState.items.find(
+                  (x) => x.productId === p.id
+                );
+                if (existing) existing.qty += 1;
+                else
+                  createState.items.push({
+                    productId: p.id,
+                    productNumber: p.productNumber,
+                    name: p.name,
+                    qty: 1,
+                    price: p.price,
+                  });
+                recompute();
+              });
+              item.append(left, add);
+              res.appendChild(item);
+            });
+          }
+
+          function getPayload() {
+            if (createState.items.length === 0)
+              throw new Error("Bitte mindestens ein Produkt hinzufügen.");
+            if (!createState.paymentMethodId)
+              throw new Error("Bitte eine Zahlungsmethode wählen.");
+            const items = createState.items.map((it) => ({
+              productId: it.productId,
+              quantity: it.qty,
+              label: it.name,
+            }));
+            const shipCost =
+              parseFloat(document.getElementById("shipPrice").value || "0") ||
+              0;
+            const base = {
+              paymentMethodId: createState.paymentMethodId,
+              items,
+              shippingMethodId: createState.shippingMethodId,
+              shippingCosts: shipCost,
+            };
+            if (createState.existing) {
+              if (!createState.customerId)
+                throw new Error("Bitte Kunden auswählen.");
+              return { customerId: createState.customerId, ...base };
+            }
+            const g = createState.guest;
+            if (!g.email || !g.firstName || !g.lastName)
+              throw new Error("Gastdaten unvollständig.");
+            const b = g.billing;
+            if (!b.countryId || !b.street || !b.city)
+              throw new Error("Rechnungsadresse unvollständig.");
+            const s = g.shippingSame ? b : g.shipping;
+            return {
+              customer: {
+                email: g.email,
+                firstName: g.firstName,
+                lastName: g.lastName,
+                billingAddress: {
+                  street: b.street,
+                  zipcode: b.zipcode,
+                  city: b.city,
+                  countryId: b.countryId,
+                },
+                shippingAddress: {
+                  street: s.street,
+                  zipcode: s.zipcode,
+                  city: s.city,
+                  countryId: s.countryId || b.countryId,
+                },
+              },
+              ...base,
+            };
+          }
+
+          // Wire events
+          cust.querySelectorAll('input[name="custMode"]').forEach((r) =>
+            r.addEventListener("change", () => {
+              createState.existing = r.value === "existing";
+              document.getElementById("custExisting").style.display =
+                createState.existing ? "block" : "none";
+              document.getElementById("custGuest").style.display =
+                createState.existing ? "none" : "block";
+            })
+          );
+          document.getElementById("gSame").addEventListener("change", (e) => {
+            const on = e.target.checked;
+            createState.guest.shippingSame = on;
+            document.getElementById("shipBlock").style.display = on
+              ? "none"
+              : "block";
+          });
+          document.getElementById("custQ").addEventListener("input", (e) => {
+            const q = e.target.value.trim();
+            clearTimeout(window.__custDeb);
+            window.__custDeb = setTimeout(() => q && searchCustomers(q), 250);
+          });
+          document.getElementById("pQ").addEventListener("input", (e) => {
+            const q = e.target.value.trim();
+            clearTimeout(window.__prodDeb);
+            window.__prodDeb = setTimeout(() => q && searchProducts(q), 250);
+          });
+
+          // Guest field bindings
+          const bind = (id, obj, key) =>
+            document
+              .getElementById(id)
+              .addEventListener("input", (e) => (obj[key] = e.target.value));
+          bind("gEmail", createState.guest, "email");
+          bind("gFirst", createState.guest, "firstName");
+          bind("gLast", createState.guest, "lastName");
+          bind("gBStreet", createState.guest.billing, "street");
+          bind("gBZip", createState.guest.billing, "zipcode");
+          bind("gBCity", createState.guest.billing, "city");
+          document
+            .getElementById("gBCountry")
+            .addEventListener(
+              "change",
+              (e) => (createState.guest.billing.countryId = e.target.value)
+            );
+          bind("gSStreet", createState.guest.shipping, "street");
+          bind("gSZip", createState.guest.shipping, "zipcode");
+          bind("gSCity", createState.guest.shipping, "city");
+          document
+            .getElementById("gSCountry")
+            .addEventListener(
+              "change",
+              (e) => (createState.guest.shipping.countryId = e.target.value)
+            );
+
+          // Submit
+          createBtn.addEventListener("click", async () => {
+            errBox.style.display = "none";
+            errBox.textContent = "";
+            try {
+              createBtn.disabled = true;
+              createBtn.textContent = "Legt an…";
+              showBusy("Bestellung wird angelegt…");
+              const payload = getPayload();
+              const r = await api.createOrder(payload);
+              if (!r || !r.ok)
+                throw new Error((r && r.error) || "Fehler beim Anlegen");
+              openOrder(r.data.id);
+            } catch (e) {
+              errBox.textContent = String(e.message || e);
+              errBox.style.display = "block";
+            } finally {
+              createBtn.disabled = false;
+              createBtn.textContent = "Bestellung anlegen";
+              hideBusy();
+            }
+          });
+          backBtn.addEventListener("click", () => setTab("orders"));
+
+          // Initial loads
+          loadPaymentMethods();
+          loadCountries();
+          loadShippingMethods();
+          recompute();
         }
 
         // Global search across all tabs
@@ -1023,6 +1601,9 @@
         async function boot() {
           const me = await api.me();
           if (me && me.ok) {
+            try {
+              state.features = await api.features();
+            } catch {}
             showApp();
             setTab("products");
           } else {

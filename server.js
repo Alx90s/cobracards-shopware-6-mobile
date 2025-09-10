@@ -121,6 +121,23 @@ if (!SHOPWARE_CLIENT_ID || !SHOPWARE_CLIENT_SECRET) {
   );
 }
 
+// Helper: ISO 8601 with local offset (e.g., 2025-09-09T10:31:00+02:00)
+function toLocalOffsetIso(date) {
+  const d = date instanceof Date ? date : new Date(date);
+  const pad = (n) => String(n).padStart(2, "0");
+  const y = d.getFullYear();
+  const m = pad(d.getMonth() + 1);
+  const day = pad(d.getDate());
+  const hh = pad(d.getHours());
+  const mm = pad(d.getMinutes());
+  const ss = pad(d.getSeconds());
+  const tz = -d.getTimezoneOffset(); // minutes east of UTC
+  const sign = tz >= 0 ? "+" : "-";
+  const tzh = pad(Math.floor(Math.abs(tz) / 60));
+  const tzm = pad(Math.abs(tz) % 60);
+  return `${y}-${m}-${day}T${hh}:${mm}:${ss}${sign}${tzh}:${tzm}`;
+}
+
 // ----------- Tiny session (cookie) -----------
 const activeSessions = new Set();
 const COOKIE_NAME = "auth";
@@ -519,6 +536,19 @@ app.post("/api/orders", requireAuth, async (req, res) => {
       throw new Error("No salutation found");
     }
 
+    async function getSalutationIdByKey(key) {
+      try {
+        const r = await shopwareFetch("/search/salutation", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Request-ID": reqId },
+          body: JSON.stringify({ page: 1, limit: 1, filter: [{ type: "equals", field: "salutationKey", value: key }] }),
+        });
+        const s = (r && r.data && r.data[0]) || null;
+        if (s && s.id) return s.id;
+      } catch {}
+      return getDefaultSalutationId();
+    }
+
     async function getCustomerDetails(id) {
       const r = await shopwareFetch("/search/customer", {
         method: "POST",
@@ -605,7 +635,19 @@ app.post("/api/orders", requireAuth, async (req, res) => {
     let shippingAddr;
     if (customerId) {
       const c = await getCustomerDetails(customerId);
-      const salId = c.salutationId || (await getDefaultSalutationId());
+      const salId = await getSalutationIdByKey('not_specified');
+      // Optional hardening: if the underlying customer has no salutation, patch it to avoid admin UI issues
+      try {
+        if (!c.salutationId) {
+          await shopwareFetch(`/customer/${encodeURIComponent(c.id)}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json", "X-Request-ID": reqId },
+            body: JSON.stringify({ salutationId: salId }),
+          });
+        }
+      } catch (e) {
+        log("warn", "customer.salutation_patch_failed", { reqId, customerId: c.id, err: formatError(e) });
+      }
       orderCustomer = {
         id: hex32(),
         orderId,
@@ -622,7 +664,7 @@ app.post("/api/orders", requireAuth, async (req, res) => {
         id: hex32(),
         orderId,
         countryId: b.countryId,
-        salutationId: b.salutationId || salId,
+        salutationId: salId,
         firstName: b.firstName || c.firstName || "",
         lastName: b.lastName || c.lastName || "",
         street: b.street || "",
@@ -635,7 +677,7 @@ app.post("/api/orders", requireAuth, async (req, res) => {
         id: hex32(),
         orderId,
         countryId: s.countryId,
-        salutationId: s.salutationId || salId,
+        salutationId: salId,
         firstName: s.firstName || c.firstName || "",
         lastName: s.lastName || c.lastName || "",
         street: s.street || "",
@@ -645,7 +687,7 @@ app.post("/api/orders", requireAuth, async (req, res) => {
       };
     } else {
       const cust = customer || {};
-      const salId = cust.salutationId || (await getDefaultSalutationId());
+      const salId = await getSalutationIdByKey('not_specified');
       if (!cust.email || !cust.firstName || !cust.lastName) {
         return res.status(400).json({ error: "customer.email, firstName, lastName are required when creating a guest order" });
       }
@@ -665,7 +707,7 @@ app.post("/api/orders", requireAuth, async (req, res) => {
         id: hex32(),
         orderId,
         countryId: b.countryId,
-        salutationId: b.salutationId || salId,
+        salutationId: salId,
         firstName: b.firstName || cust.firstName,
         lastName: b.lastName || cust.lastName,
         street: b.street,
@@ -678,7 +720,7 @@ app.post("/api/orders", requireAuth, async (req, res) => {
         id: hex32(),
         orderId,
         countryId: s.countryId,
-        salutationId: s.salutationId || salId,
+        salutationId: salId,
         firstName: s.firstName || cust.firstName,
         lastName: s.lastName || cust.lastName,
         street: s.street,
@@ -722,7 +764,11 @@ app.post("/api/orders", requireAuth, async (req, res) => {
         identifier: p.productNumber || p.id,
         label: it.label || p.name || p.productNumber || "Item",
         quantity: qty,
+        type: "product",
         states: [],
+        good: true,
+        stackable: true,
+        removable: true,
         price: makeCalculatedPrice(unitPrice, qty),
         children: [],
         payload: { productNumber: p.productNumber || undefined },
@@ -749,10 +795,20 @@ app.post("/api/orders", requireAuth, async (req, res) => {
       shippingOrderAddressId: shippingAddr.id,
       shippingMethodId,
       stateId: deliveryStateId,
-      shippingDateEarliest: now.toISOString(),
-      shippingDateLatest: latest.toISOString(),
+      shippingDateEarliest: toLocalOffsetIso(now),
+      shippingDateLatest: toLocalOffsetIso(latest),
       shippingCosts: { unitPrice: shippingCostsOverride, totalPrice: shippingCostsOverride, quantity: 1, calculatedTaxes: [], taxRules: [] },
     };
+    // Optional: create delivery positions for each line item (closer to storefront structure)
+    try {
+      const positions = lineItems.map((li) => ({
+        id: hex32(),
+        orderDeliveryId: delivery.id,
+        orderLineItemId: li.id,
+        price: { ...li.price },
+      }));
+      if (positions.length) delivery.positions = positions;
+    } catch {}
 
     // 8) Assemble order payload
     const orderPayload = {
@@ -761,7 +817,7 @@ app.post("/api/orders", requireAuth, async (req, res) => {
       salesChannelId,
       currencyId,
       languageId,
-      orderDateTime: new Date().toISOString(),
+      orderDateTime: toLocalOffsetIso(new Date()),
       currencyFactor: Number(currencyFactor) || 1.0,
       stateId: orderStateId,
       itemRounding,
@@ -1082,16 +1138,35 @@ app.post("/api/orders/:id/invoice-email", requireAuth, async (req, res) => {
     if (!ENABLE_INVOICE_ACTIONS) {
       return res.status(501).json({ error: "Invoice actions disabled by server config" });
     }
-    // 1) Create invoice document
-    await shopwareFetch("/_action/order/document/invoice/create", {
+
+    // Load order with associations to get email/name
+    const orderCrit = {
+      page: 1,
+      limit: 1,
+      associations: { orderCustomer: {} },
+      filter: [{ type: "equals", field: "id", value: id }],
+    };
+    const swOrder = await shopwareFetch("/search/order", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Request-ID": req.id },
-      body: JSON.stringify([
-        { orderId: id, type: "invoice", fileType: "pdf", static: false, config: {} },
-      ]),
+      body: JSON.stringify(orderCrit),
+    });
+    const o = (swOrder.data || [])[0];
+    if (!o) return res.status(404).json({ error: "Order not found" });
+    const salesChannelId = o.salesChannelId;
+    const orderLangId = o.languageId || null;
+    const rcptEmail = o.orderCustomer?.email;
+    const rcptName = [o.orderCustomer?.firstName, o.orderCustomer?.lastName].filter(Boolean).join(" ") || SHOP_NAME;
+    if (!rcptEmail) return res.status(400).json({ error: "Order has no customer email" });
+
+    // Create invoice document
+    await shopwareFetch("/_action/order/document/invoice/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Request-ID": req.id, ...(orderLangId ? { "sw-language-id": orderLangId } : {}) },
+      body: JSON.stringify([{ orderId: id, type: "invoice", fileType: "pdf", static: false, config: {} }]),
     });
 
-    // 2) Find newest invoice document
+    // Find newest invoice document
     const docCriteria = {
       page: 1,
       limit: 1,
@@ -1109,23 +1184,60 @@ app.post("/api/orders/:id/invoice-email", requireAuth, async (req, res) => {
     const d = (swDoc.data || [])[0];
     if (!d) return res.status(500).json({ error: "Rechnungsdokument nicht gefunden" });
 
-    // 3) Trigger order state transition with sendMail + attach the invoice document
-    // Default transition can be overridden via ?transition=complete|process|...
-    const preferred = String(req.query.transition || "complete");
-    const attempts = [preferred, "process"];
-    let lastErr = null;
-    for (const t of attempts) {
-      const resp = await fetch(`${adminBase}/_action/order/${id}/state/${encodeURIComponent(t)}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${await getShopwareToken()}` },
-        body: JSON.stringify({ sendMail: true, documentIds: [d.id] }),
-      });
-      if (resp.ok) {
-        return res.json({ ok: true, sent: true, transition: t });
-      }
-      lastErr = await resp.text();
+    // Download PDF and attach via binAttachments
+    const token = await getShopwareToken();
+    // Load document to get deepLinkCode if not present
+    let deepCode = d.deepLinkCode;
+    if (!deepCode) {
+      const docFull = await shopwareFetch(`/document/${d.id}`, { method: "GET" });
+      deepCode = docFull?.data?.attributes?.deepLinkCode || docFull?.data?.deepLinkCode || docFull?.deepLinkCode || null;
     }
-    return res.status(502).json({ error: "Versand via Statuswechsel fehlgeschlagen", info: String(lastErr).slice(0, 500) });
+    const dlUrl = deepCode
+      ? `${adminBase}/_action/document/${d.id}/${deepCode}?download=1`
+      : `${adminBase}/_action/order/document/download`;
+    let pdfBuf;
+    if (deepCode) {
+      const up = await fetch(dlUrl, { headers: { Authorization: `Bearer ${token}`, Accept: "application/octet-stream" } });
+      if (!up.ok) return res.status(502).json({ error: `Dokument-Download fehlgeschlagen: ${up.status}` });
+      const ab = await up.arrayBuffer();
+      pdfBuf = Buffer.from(ab);
+    } else {
+      const up = await fetch(dlUrl, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, Accept: "application/octet-stream", "Content-Type": "application/json" },
+        body: JSON.stringify([d.id]),
+      });
+      if (!up.ok) return res.status(502).json({ error: `Dokument-Download fehlgeschlagen: ${up.status}` });
+      const ab = await up.arrayBuffer();
+      pdfBuf = Buffer.from(ab);
+    }
+
+    const docNum = d.documentNumber || o.orderNumber || id;
+    const fileName = `Rechnung-${docNum}.pdf`;
+    const contentHtml = `Hallo ${rcptName},<br/><br/>im Anhang finden Sie Ihre Rechnung ${docNum}.`;
+    const contentPlain = `Hallo ${rcptName},\n\nim Anhang finden Sie Ihre Rechnung ${docNum}.`;
+
+    const mailPayload = {
+      recipients: { [rcptEmail]: rcptName },
+      salesChannelId,
+      subject: `Ihre Rechnung ${docNum}`,
+      senderName: SHOP_NAME,
+      contentHtml,
+      contentPlain,
+      binAttachments: [
+        { fileName, mimeType: "application/pdf", content: pdfBuf.toString("base64") },
+      ],
+    };
+    const mailResp = await fetch(`${adminBase}/_action/mail-template/send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}`, ...(orderLangId ? { "sw-language-id": orderLangId } : {}) },
+      body: JSON.stringify(mailPayload),
+    });
+    if (!mailResp.ok) {
+      const t = await mailResp.text();
+      return res.status(502).json({ error: `E-Mail Versand fehlgeschlagen: ${mailResp.status}`, info: t.slice(0, 500) });
+    }
+    return res.json({ ok: true, sent: true });
   } catch (e) {
     log("error", "route.error", { reqId: req.id, route: "/api/orders/:id/invoice-email", err: formatError(e) });
     res.status(500).json({ error: formatError(e) });
@@ -1334,6 +1446,19 @@ app.get("/api/countries", requireAuth, async (req, res) => {
     res.json({ total: sw.total || data.length, data });
   } catch (e) {
     log("error", "route.error", { reqId: req.id, route: "/api/countries", err: formatError(e) });
+    res.status(500).json({ error: formatError(e) });
+  }
+});
+
+// Salutations list
+app.get("/api/salutations", requireAuth, async (req, res) => {
+  try {
+    const sw = await searchWithRetry("/search/salutation", { page: 1, limit: 50, sort: [{ field: "displayName", order: "ASC" }] }, req.id);
+    const data = (sw.data || []).map((s) => ({ id: s.id, key: s.salutationKey, name: s.displayName, letterName: s.letterName }));
+    res.set("Cache-Control", "no-store");
+    res.json({ total: sw.total || data.length, data });
+  } catch (e) {
+    log("error", "route.error", { reqId: req.id, route: "/api/salutations", err: formatError(e) });
     res.status(500).json({ error: formatError(e) });
   }
 });
